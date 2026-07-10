@@ -1,0 +1,14 @@
+{
+  "id": "gabemccrea/ptcg-bc-train",
+  "title": "ptcg-bc-train",
+  "code_file": "train_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_internet": "false",
+  "dataset_sources": ["gabemccrea/ptcg-train-data"],
+  "competition_sources": ["pokemon-tcg-ai-battle"],
+  "kernel_sources": []
+}

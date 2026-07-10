@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local game data — large, regenerable
+replays/
+experiments/*/artifacts/
+
+# Official engine + card data downloaded from Kaggle (re-download on each machine)
+data/official/
+
+# Mined ladder data and training staging — large, regenerable via ptcg.data tools
+data/episodes/
+data/train/*
+!data/train/bc_net.npz
+data/kaggle_train_ds/*
+!data/kaggle_train_ds/dataset-metadata.json
+data/kaggle_kernel/out/
+
+# Build output
+dist/
+
+# Secrets
+kaggle.json
