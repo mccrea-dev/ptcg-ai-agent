@@ -210,6 +210,11 @@ def make_agent(deck: list[int] | None = None,
             opp_guess = opp_deck_guess
 
         obs_cls = api.to_observation_class(obs)
+        # Endgame: with <=2 prizes on either side, games resolve within the
+        # horizon anyway — take exact results instead of eval estimates.
+        players = obs["current"]["players"]
+        endgame = min(len(players[0]["prize"]), len(players[1]["prize"])) <= 2
+        steps_cap = MAX_ROLLOUT_STEPS if endgame else rollout_steps
         survivors = list(candidates)
         sums = dict.fromkeys(candidates, 0.0)
         counts = dict.fromkeys(candidates, 0)
@@ -227,7 +232,7 @@ def make_agent(deck: list[int] | None = None,
                     det.opponent_prize, det.opponent_hand, det.opponent_active,
                 )
                 for i in survivors:
-                    sums[i] += _rollout(root, [i], rollout_policy, rollout_steps)
+                    sums[i] += _rollout(root, [i], rollout_policy, steps_cap)
                     counts[i] += 1
                 api.search_end()
                 passes += 1
