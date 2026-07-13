@@ -13,27 +13,44 @@ from ptcg.decks import load_deck
 DECK = load_deck("starter")
 
 
-def _attack_damage_estimates() -> dict[int, int]:
-    """attackId -> estimated damage. Scaling attacks ("does X damage for each
-    ...") report damage=0 in the metadata; estimate them at 3x the coefficient,
-    which is roughly what a built deck achieves mid-game."""
+def _attack_damage_estimates() -> tuple[dict[int, int], dict[int, tuple[int, str]], set[int]]:
+    """Static estimates plus scaling rules. Scaling attacks ("does X damage for
+    each ..." / "place N damage counters for each ...") report damage=0 in the
+    metadata; where the multiplier is a quantity we can read off the board
+    (cards in hand, benched Pokemon), record it so effective_damage can compute
+    the real number at decision time. Counter-placing attacks bypass weakness
+    and resistance, so remember which ones those are."""
     from ptcg.engine.sdk import api
 
-    estimates = {}
+    estimates, scaling, counters = {}, {}, set()
     for a in api.all_attack():
         damage = a.damage
         if damage == 0 and a.text:
+            coef = None
             m = re.search(r"does (\d+)(?:\+|\smore)? damage for each", a.text)
             if m:
-                damage = int(m.group(1)) * 3
+                coef = int(m.group(1))
+            else:
+                m = re.search(r"place (\d+) damage counters?\b.*for each", a.text,
+                              re.IGNORECASE)
+                if m:
+                    coef = int(m.group(1)) * 10
+                    counters.add(a.attackId)
+            if coef is not None:
+                text = a.text.lower()
+                if "card in your hand" in text:
+                    scaling[a.attackId] = (coef, "hand")
+                elif "benched pok" in text or "pokémon on your bench" in text:
+                    scaling[a.attackId] = (coef, "bench")
+                damage = coef * 3  # static fallback
         estimates[a.attackId] = damage
-    return estimates
+    return estimates, scaling, counters
 
 
 try:
-    ATTACK_DAMAGE = _attack_damage_estimates()
+    ATTACK_DAMAGE, ATTACK_SCALING, COUNTER_ATTACKS = _attack_damage_estimates()
 except ImportError:  # SDK not present; fall back to position-based attack choice
-    ATTACK_DAMAGE = {}
+    ATTACK_DAMAGE, ATTACK_SCALING, COUNTER_ATTACKS = {}, {}, set()
 
 # OptionType values from the official SDK (cg/api.py).
 EVOLVE, ABILITY, PLAY, ATTACH, ATTACK = 9, 10, 7, 8, 13
@@ -81,13 +98,16 @@ def battle_ctx(current) -> dict | None:
         data = _cards().get(_get(active, "id"))
         if data is None:
             return None
+        mine = players[me]
         return {
             "opp_hp": _get(active, "hp") or 0,
             "opp_weakness": data.weakness,
             "opp_resistance": data.resistance,
             "opp_prize_worth": 3 if data.megaEx else 2 if data.ex else 1,
             "opp_prizes_left": sum(1 for c in (_get(opp, "prize") or []) if c is None),
-            "my_energy_type": _my_attack_type(players[me]),
+            "my_energy_type": _my_attack_type(mine),
+            "my_hand_count": _get(mine, "handCount") or 0,
+            "my_bench_count": len(_get(mine, "bench") or []),
         }
     except Exception:
         return None
@@ -103,9 +123,19 @@ def _my_attack_type(mine):
 
 
 def effective_damage(attack_id: int, ctx: dict | None) -> int:
-    """Damage estimate adjusted for the defender's weakness/resistance."""
+    """Damage estimate adjusted for board-readable scaling and the defender's
+    weakness/resistance."""
     est = ATTACK_DAMAGE.get(attack_id, 0)
     if ctx is None:
+        return est
+    scale = ATTACK_SCALING.get(attack_id)
+    if scale is not None:
+        coef, kind = scale
+        if kind == "hand":
+            est = coef * ctx.get("my_hand_count", 3)
+        elif kind == "bench":
+            est = coef * ctx.get("my_bench_count", 3)
+    if attack_id in COUNTER_ATTACKS:  # damage counters ignore weakness/resistance
         return est
     if ctx["opp_weakness"] is not None and ctx["opp_weakness"] == ctx["my_energy_type"]:
         est *= 2

@@ -2,22 +2,21 @@
 
 At each main-phase decision on our own turn, candidate options are evaluated
 by determinized rollouts: sample the hidden zones, play the option, then let
-the priority policy finish the game for both sides through the native search
-API. The option with the best average outcome wins. All other selections
-(card picks, discards, yes/no...) are answered instantly by the priority
-policy — searching those too is future work.
+the tactical policy finish the game for both sides through the native search
+API. The option with the best average outcome wins. Multi-pick selects and
+forced moves are answered instantly by the tactical policy.
 
 Clock handling: Kaggle gives each player one 600-second overage pool for the
 whole game and running out is an instant loss. Each decision gets a slice of
 what remains; below the reserve we stop searching entirely and play the
-priority policy, which answers in microseconds.
+tactical policy, which answers in microseconds.
 """
 
 import os
 import random
 import time
 
-from ptcg.agents import priority_agent
+from ptcg.agents import priority_agent, tactical
 from ptcg.agents.search import determinize
 from ptcg.decks import load_deck
 from ptcg.engine.sdk import api
@@ -29,11 +28,9 @@ MAX_ROLLOUT_STEPS = 3000
 
 
 def _policy_on_search_obs(observation) -> list[int]:
-    """Run the priority policy on a search-API Observation dataclass."""
-    sel = observation.select
-    options = [{"type": o.type, "attackId": o.attackId} for o in sel.option]
-    return priority_agent.agent({"select": {"option": options, "maxCount": sel.maxCount},
-                                 "current": observation.current})
+    """Run the tactical policy on a search-API Observation dataclass (its
+    accessors tolerate dataclasses directly)."""
+    return tactical.choose(observation.select, observation.current)
 
 
 def _rollout(root, first_action: list[int], policy=_policy_on_search_obs) -> float:
@@ -99,6 +96,7 @@ def make_agent(deck: list[int] | None = None,
     # active as null until turn 1, so this memory keeps the unseen-pool math
     # balanced and the setup-bench decisions searchable.
     remembered_active: list[int | None] = [None]
+    fast_policy = tactical.make_agent(deck)
     ranker = None
     if ranker_path is not None:
         from ptcg.agents.learned import NumpyRanker
@@ -148,27 +146,28 @@ def make_agent(deck: list[int] | None = None,
         if facedown and (not setup_search or remembered_active[0] is None):
             searchable = False
         if not searchable:
-            return choose_and_remember(obs, priority_agent.agent(obs))
+            return choose_and_remember(obs, fast_policy(obs))
 
         remaining = obs.get("remainingOverageTime") if use_clock else None
         budget = _decision_budget(remaining, default_budget, reserve_seconds)
         if budget <= 0.0:
-            return choose_and_remember(obs, priority_agent.agent(obs))
+            return choose_and_remember(obs, fast_policy(obs))
 
         # Concentrate rollouts on the most plausible moves — ranked by the
-        # trained expert-imitation net when available, else the priority policy.
+        # trained expert-imitation net when available, else the tactical policy.
         options = select["option"]
+        candidates = None
         if ranker is not None:
             try:
                 net_scores = ranker.scores(select, obs["current"],
                                            priority_agent.ATTACK_DAMAGE)
                 candidates = sorted(range(n), key=lambda i: -net_scores[i])
             except Exception:
-                candidates = sorted(range(n),
-                                    key=lambda i: priority_agent._score(i, options[i], True))
-        else:
+                candidates = None
+        if candidates is None:
+            pol = tactical.AlakazamPolicy(select, obs["current"])
             candidates = sorted(range(n),
-                                key=lambda i: priority_agent._score(i, options[i], True))
+                                key=lambda i: -pol._score_option(i, options[i]))
         candidates = candidates[:max_options]
 
         if infer_opponent:
@@ -222,9 +221,9 @@ def make_agent(deck: list[int] | None = None,
                 api.search_end()
             except Exception:
                 pass
-            return choose_and_remember(obs, priority_agent.agent(obs))
+            return choose_and_remember(obs, fast_policy(obs))
         if passes == 0:
-            return choose_and_remember(obs, priority_agent.agent(obs))
+            return choose_and_remember(obs, fast_policy(obs))
         return choose_and_remember(
             obs, [max(survivors, key=lambda i: sums[i] / counts[i])])
 
