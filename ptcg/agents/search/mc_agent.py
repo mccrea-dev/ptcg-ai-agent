@@ -33,20 +33,28 @@ def _policy_on_search_obs(observation) -> list[int]:
     return tactical.choose(observation.select, observation.current)
 
 
-def _rollout(root, first_action: list[int], policy=_policy_on_search_obs) -> float:
-    """Play first_action from root, then policy-vs-policy to the end.
-    Returns +1 if the player to move at root wins, -1 loss, 0 draw/cutoff."""
+def _rollout(root, first_action: list[int], policy=_policy_on_search_obs,
+             max_steps: int = MAX_ROLLOUT_STEPS) -> float:
+    """Play first_action from root, then policy-vs-policy to the end (or the
+    step cap). Returns +1/-1 for a real result; at the cap, the prize
+    differential as a value estimate in (-1, 1) — a truncated rollout with a
+    sane eval buys several finished-game rollouts' worth of signal per second."""
     me = root.observation.current.yourIndex
     state = api.search_step(root.searchId, first_action)
     steps = 0
-    while state.observation.current.result < 0 and steps < MAX_ROLLOUT_STEPS:
+    while state.observation.current.result < 0 and steps < max_steps:
         state = api.search_step(state.searchId, policy(state.observation))
         steps += 1
-    result = state.observation.current.result
+    cur = state.observation.current
+    result = cur.result
     if result == me:
         return 1.0
     if result == 1 - me:
         return -1.0
+    if result < 0:  # truncated: fewer prizes left = closer to winning
+        mine = len(cur.players[me].prize)
+        theirs = len(cur.players[1 - me].prize)
+        return (theirs - mine) / 6.0
     return 0.0
 
 
@@ -66,7 +74,8 @@ def make_agent(deck: list[int] | None = None,
                seed: int | None = None,
                budget_seconds: float = 1.5,
                reserve_seconds: float = 60.0,
-               max_options: int = 10,
+               max_options: int = 5,  # tactical ordering is strong; fewer
+               # candidates = more rollouts each (was 10 with a weak prior)
                # Ladder replays showed a median of only 104s of the 600s pool
                # being spent: the old cap of 24 passes bound before the time
                # budget did. Passes are now effectively time-limited.
@@ -76,7 +85,10 @@ def make_agent(deck: list[int] | None = None,
                confidence_prune_z: float = 0.0,
                setup_search: bool = False,  # default off until its A/B reports
                ranker_path: str | None = None,  # trained BC net for root ordering
-               net_rollouts: bool = False):  # net also pilots both sides in rollouts
+               net_rollouts: bool = False,  # net also pilots both sides in rollouts
+               prior_anchor_z: float = 1.0,  # 0 = raw argmax over rollout means
+               rollout_steps: int = 160):  # truncate + prize-diff eval; ~4-6
+               # turns of lookahead at a fraction of a finished game's cost
     # halving_schedule stays available for experiments, but defaults off:
     # pruning on 4 noisy rollouts measured 46.7% CI[34.6,59.1] vs uniform.
     # confidence_prune_z > 0 enables evidence-based pruning instead: an option
@@ -194,7 +206,7 @@ def make_agent(deck: list[int] | None = None,
                     det.opponent_prize, det.opponent_hand, det.opponent_active,
                 )
                 for i in survivors:
-                    sums[i] += _rollout(root, [i], rollout_policy)
+                    sums[i] += _rollout(root, [i], rollout_policy, rollout_steps)
                     counts[i] += 1
                 api.search_end()
                 passes += 1
@@ -224,6 +236,31 @@ def make_agent(deck: list[int] | None = None,
             return choose_and_remember(obs, fast_policy(obs))
         if passes == 0:
             return choose_and_remember(obs, fast_policy(obs))
+        if prior_anchor_z > 0 and candidates[0] in survivors:
+            # Trust the tactical policy's choice unless a challenger's rollout
+            # mean beats it with statistical separation. With few rollouts the
+            # threshold is unreachable and we play the policy move; with many,
+            # genuine improvements clear it. Search becomes strictly additive
+            # (measured: raw argmax over 2-3 rollouts/option scored 39% vs the
+            # policy's own 50% against pixiux — noise overriding a good prior).
+            anchor = candidates[0]
+
+            def mean_se(i):
+                # Variance floored at 0.25: a short streak of ±1 outcomes must
+                # not masquerade as certainty (at m=±1 the sample variance is 0).
+                m = sums[i] / counts[i]
+                return m, (max(1.0 - m * m, 0.25) / counts[i]) ** 0.5
+
+            a_mean, a_se = mean_se(anchor)
+            best, best_margin = anchor, 0.0
+            for i in survivors:
+                if i == anchor or counts[i] < 4:
+                    continue
+                m, se = mean_se(i)
+                margin = (m - a_mean) - prior_anchor_z * (se + a_se)
+                if margin > 0 and margin > best_margin:
+                    best, best_margin = i, margin
+            return choose_and_remember(obs, [best])
         return choose_and_remember(
             obs, [max(survivors, key=lambda i: sums[i] / counts[i])])
 

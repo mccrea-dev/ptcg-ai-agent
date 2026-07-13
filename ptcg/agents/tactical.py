@@ -30,7 +30,9 @@ OPT_RETREAT, OPT_ATTACK, OPT_END = 12, 13, 14
 
 # SelectContext values (cg/api.py).
 CTX_MAIN, CTX_SETUP_ACTIVE, CTX_SETUP_BENCH, CTX_SWITCH, CTX_TO_ACTIVE = 0, 1, 2, 3, 4
+CTX_TO_BENCH = 5
 CTX_TO_HAND, CTX_DISCARD = 7, 8
+CTX_TO_DECK, CTX_TO_DECK_BOTTOM = 9, 10
 CTX_ATTACH_FROM = 21
 CTX_IS_FIRST = 41
 
@@ -84,18 +86,49 @@ def _prize_worth(pokemon) -> int:
     return 3 if data.megaEx else 2 if data.ex else 1
 
 
+_threat_cache: dict[str, int] = {}
+
+
+def _future_prize_worth(card_id: int) -> int:
+    """Best prize worth this card can evolve into (kill the egg before it
+    hatches: a benched Riolu is a future 3-prize Mega Lucario)."""
+    if not _threat_cache:
+        by_name: dict[str, int] = {}
+        for c in _cards().values():
+            worth = 3 if c.megaEx else 2 if c.ex else 1
+            by_name[c.name] = max(by_name.get(c.name, 1), worth)
+        for _ in range(2):  # propagate through two-stage lines
+            for c in _cards().values():
+                base = c.evolvesFrom
+                if base:
+                    mine = _threat_cache.get(c.name, by_name.get(c.name, 1))
+                    if mine > _threat_cache.get(base, 0):
+                        _threat_cache[base] = mine
+    data = _cards().get(card_id)
+    if data is None:
+        return 1
+    return max(_threat_cache.get(data.name, 1),
+               3 if data.megaEx else 2 if data.ex else 1)
+
+
 def _target_score(pokemon) -> float:
     """How much we want to KO this opponent Pokemon (pixiux's prize economy):
-    prizes first, then invested energy/tools, evolution stage, HP."""
+    prizes first, then denial — invested energy and evolvable basics are their
+    future offense — then evolution stage and HP."""
     data = _cards().get(_get(pokemon, "id"))
+    energies = len(_get(pokemon, "energies") or [])
     score = _prize_worth(pokemon) * 1000
-    score += len(_get(pokemon, "energies") or []) * 150
+    score += energies * 250
     score += len(_get(pokemon, "tools") or []) * 100
     if data is not None:
         if data.stage2:
             score += 250
         elif data.stage1:
             score += 130
+        elif energies >= 1:  # an invested basic is their next evolution line
+            score += 350
+        # Deny future multi-prize attackers while they're still small.
+        score += (_future_prize_worth(_get(pokemon, "id")) - _prize_worth(pokemon)) * 250
     return score + (_get(pokemon, "hp") or 0)
 
 
@@ -134,7 +167,7 @@ class AlakazamPolicy:
         players = _get(current, "players") if current is not None else None
         self.me = players[self.me_idx] if players else None
         self.opp = players[1 - self.me_idx] if players else None
-        self.plan = Plan()
+        self._plan = None
 
         self.hand_ids = [_get(c, "id") for c in (_get(self.me, "hand") or [])] \
             if self.me is not None else []
@@ -143,8 +176,17 @@ class AlakazamPolicy:
                          and not _get(self.state, "supporterPlayed"))
         self.can_switch = any(_get(o, "type") == OPT_RETREAT
                               for o in (_get(obs_select, "option") or []))
-        if self.me is not None:
-            self._plan_attack()
+
+    @property
+    def plan(self) -> Plan:
+        # Lazy: most selects (yes/no, fetches, discards) never consult the
+        # plan, and this is the policy's one expensive computation — building
+        # it eagerly measurably slowed search rollouts.
+        if self._plan is None:
+            self._plan = Plan()
+            if self.me is not None:
+                self._plan_attack()
+        return self._plan
 
     def _board(self, player) -> list:
         return list(_get(player, "active") or []) + list(_get(player, "bench") or [])
@@ -204,12 +246,12 @@ class AlakazamPolicy:
                     score += have
                     if score > best_score:
                         best_score = score
-                        self.plan.attacker = a_idx
-                        self.plan.target = t_idx
-                        self.plan.attack_id = attack_id
-                        self.plan.needs_energy = needs_energy
-                        self.plan.lethal = prize > 0
-                        self.plan.winning = winning
+                        self._plan.attacker = a_idx
+                        self._plan.target = t_idx
+                        self._plan.attack_id = attack_id
+                        self._plan.needs_energy = needs_energy
+                        self._plan.lethal = prize > 0
+                        self._plan.winning = winning
 
     # ---- option scoring (single scalar, higher = chosen first) ----
 
@@ -227,7 +269,11 @@ class AlakazamPolicy:
         if kind == OPT_NUMBER:
             return _get(option, "number") or 0
         if kind == OPT_YES:
-            return 100 if self.context == CTX_IS_FIRST else 1
+            if self.context == CTX_IS_FIRST:
+                # Go second: first supporter and first attack beat first evolve
+                # for a draw-engine deck. (A/B'd vs going first.)
+                return -1
+            return 1
         if kind == OPT_NO:
             return 0
         if kind == OPT_CARD:
@@ -326,8 +372,19 @@ class AlakazamPolicy:
             return {DUNSPARCE: 4, ABRA: 1}.get(_get(card, "id"), 0) if card is not None else 0
         if self.context == CTX_SETUP_BENCH:
             return 10
+        if self.context == CTX_TO_BENCH:
+            # Poffin fetches: Abras become Alakazams, everything else is filler.
+            return {ABRA: 100, DUNSPARCE: 50}.get(_get(card, "id"), 10) \
+                if card is not None else 0
         if self.context == CTX_TO_HAND:
             return self._score_to_hand(card)
+        if self.context in (CTX_TO_DECK, CTX_TO_DECK_BOTTOM):
+            # Dual-use: from hand it's "return the junk", but from the discard
+            # it's recovery (Night Stretcher / Sacred Ash) — send our best
+            # cards back to the deck so we can draw them again.
+            if _get(option, "area") == AREA_DISCARD:
+                return self._score_to_hand(card)
+            return self._score_discard(card)
         if self.context == CTX_DISCARD:
             return self._score_discard(card)
         if self.context == CTX_ATTACH_FROM:
@@ -336,18 +393,28 @@ class AlakazamPolicy:
         return 0
 
     def _score_promote(self, option, card) -> float:
-        """New active after retreat/KO: the plan attacker, else best-armed."""
+        """New active after retreat/KO: the plan attacker, else whoever hits
+        hardest from the front next turn (counting one attach from hand —
+        a 0-energy Alakazam plus an attach is a full Powerful Hand, while
+        anything that can't attack is a wasted turn we can't afford)."""
         if card is None:
             return 0
         if _get(option, "index") == self.plan.attacker - 1:
-            return 100
-        card_id = _get(card, "id")
+            return 10000
+        data = _cards().get(_get(card, "id"))
+        if data is None:
+            return 0
         have = len(_get(card, "energies") or [])
-        score = have * 2.0
-        score += {ALAKAZAM: 20 if have >= 1 else 8,
-                  KADABRA: 10 if have >= 1 else 5,
-                  DUDUNSPARCE: 6, DUNSPARCE: 5, ABRA: 3}.get(card_id, 0)
-        return score
+        hand_energy = any(c in ENERGY_IDS for c in self.hand_ids)
+        opp_active = (self._board(self.opp) or [None])[0]
+        best = 0.0
+        for attack_id in data.attacks:
+            missing = _costs().get(attack_id, 99) - have
+            if missing > 1 or (missing == 1 and not hand_energy):
+                continue
+            dmg = _damage(attack_id, self.hand_count, data.energyType, opp_active)
+            best = max(best, dmg + (40 if missing <= 0 else 0))
+        return best + (_get(card, "hp") or 0) * 0.05
 
     def _score_to_hand(self, card) -> float:
         if card is None:

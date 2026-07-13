@@ -1,8 +1,8 @@
 """Kaggle submission entry point. This file is bundled to the archive root;
 Kaggle unpacks it at /kaggle_simulations/agent/ and calls agent() directly.
 
-v2: clock-aware Monte Carlo search (ptcg.agents.search.mc_agent) with the
-priority policy as its internal fallback, and random-legal as the last-ditch
+Clock-aware Monte Carlo search (ptcg.agents.search.mc_agent) with the
+tactical policy as its internal fallback, and random-legal as the last-ditch
 fallback if the ptcg package itself fails to load. A crash or timeout is an
 automatic loss, so every layer degrades instead of raising.
 """
