@@ -211,10 +211,14 @@ def make_agent(deck: list[int] | None = None,
 
         obs_cls = api.to_observation_class(obs)
         # Endgame: with <=2 prizes on either side, games resolve within the
-        # horizon anyway — take exact results instead of eval estimates.
+        # horizon anyway — take exact results instead of eval estimates. Cap
+        # at 4x the normal horizon (not unbounded: a stall matchup's 3000-step
+        # rollouts inside one pass could blow the clock pool right when it's
+        # lowest).
         players = obs["current"]["players"]
         endgame = min(len(players[0]["prize"]), len(players[1]["prize"])) <= 2
-        steps_cap = MAX_ROLLOUT_STEPS if endgame else rollout_steps
+        steps_cap = min(MAX_ROLLOUT_STEPS, rollout_steps * 4) if endgame \
+            else rollout_steps
         survivors = list(candidates)
         sums = dict.fromkeys(candidates, 0.0)
         counts = dict.fromkeys(candidates, 0)
@@ -234,6 +238,10 @@ def make_agent(deck: list[int] | None = None,
                 for i in survivors:
                     sums[i] += _rollout(root, [i], rollout_policy, steps_cap)
                     counts[i] += 1
+                    # A pass is re-entrant on the clock: without this check a
+                    # slow pass can overshoot the deadline by its full length.
+                    if time.monotonic() >= deadline and min(counts.values()) > 0:
+                        break
                 api.search_end()
                 passes += 1
                 # Anchored focus: the decision rule only asks "does some
