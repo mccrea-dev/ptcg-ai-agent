@@ -33,12 +33,35 @@ def _policy_on_search_obs(observation) -> list[int]:
     return tactical.choose(observation.select, observation.current)
 
 
+def _truncated_value(cur, me: int) -> float:
+    """Board-aware value for a rollout cut off mid-game, in (-1, 1) so real
+    results (+/-1) always dominate. Prizes are the game, powered attackers
+    and board width are tempo, hand is resources (and literal damage for
+    hand-scaling decks). Profiling showed rollout cost is ~all engine steps,
+    so a richer eval at a shorter horizon beats more steps."""
+    mine, theirs = cur.players[me], cur.players[1 - me]
+
+    def powered(player):
+        return sum(1 for p in (player.active or []) + (player.bench or [])
+                   if p is not None and len(p.energies or []) >= 1)
+
+    def width(player):
+        return sum(1 for p in (player.active or []) + (player.bench or [])
+                   if p is not None)
+
+    v = 0.60 * (len(theirs.prize) - len(mine.prize)) / 6.0
+    v += 0.15 * max(-1.0, min(1.0, (powered(mine) - powered(theirs)) / 3.0))
+    v += 0.10 * (width(mine) - width(theirs)) / 6.0
+    v += 0.15 * max(-1.0, min(1.0, (len(mine.hand) - len(theirs.hand)) / 10.0))
+    return v
+
+
 def _rollout(root, first_action: list[int], policy=_policy_on_search_obs,
              max_steps: int = MAX_ROLLOUT_STEPS) -> float:
     """Play first_action from root, then policy-vs-policy to the end (or the
-    step cap). Returns +1/-1 for a real result; at the cap, the prize
-    differential as a value estimate in (-1, 1) — a truncated rollout with a
-    sane eval buys several finished-game rollouts' worth of signal per second."""
+    step cap). Returns +1/-1 for a real result, else a board-aware value
+    estimate — a truncated rollout with a sane eval buys several finished
+    games' worth of signal per second."""
     me = root.observation.current.yourIndex
     state = api.search_step(root.searchId, first_action)
     steps = 0
@@ -51,10 +74,8 @@ def _rollout(root, first_action: list[int], policy=_policy_on_search_obs,
         return 1.0
     if result == 1 - me:
         return -1.0
-    if result < 0:  # truncated: fewer prizes left = closer to winning
-        mine = len(cur.players[me].prize)
-        theirs = len(cur.players[1 - me].prize)
-        return (theirs - mine) / 6.0
+    if result < 0:
+        return _truncated_value(cur, me)
     return 0.0
 
 
@@ -210,6 +231,17 @@ def make_agent(deck: list[int] | None = None,
                     counts[i] += 1
                 api.search_end()
                 passes += 1
+                # Anchored focus: the decision rule only asks "does some
+                # challenger beat the tactical move with confidence?" — after
+                # a uniform look, spend the rest of the budget answering that
+                # for the two best challengers instead of sampling everyone.
+                if (prior_anchor_z > 0 and passes == 4 and len(survivors) > 3
+                        and candidates[0] in survivors):
+                    anchor = candidates[0]
+                    challengers = sorted(
+                        (i for i in survivors if i != anchor),
+                        key=lambda i: sums[i] / counts[i], reverse=True)[:2]
+                    survivors = [anchor] + challengers
                 # Successive halving: drop the losing half and reinvest their
                 # rollouts in the contenders.
                 if passes in halving_schedule and len(survivors) > 2:

@@ -288,8 +288,15 @@ class AlakazamPolicy:
             target = self._in_play(option)
             return 9000 + len(_get(target, "energies") or []) if target is not None else 9000
         if kind == OPT_ABILITY:
-            # Run Away Draw etc: free cards. Skip when it would deck us out.
-            return -1 if self._low_deck() else 30000
+            # Run Away Draw etc: free cards. Skip when it would deck us out,
+            # and don't let Dudunsparce shuffle itself off a thin board.
+            if self._low_deck():
+                return -1
+            card = self._card_at(option)
+            if (card is not None and _get(card, "id") == DUDUNSPARCE
+                    and sum(1 for p in self._board(self.me) if p is not None) <= 2):
+                return -1
+            return 30000
         if kind == OPT_RETREAT:
             return 2000 if self.plan.attacker >= 1 else -1
         if kind == OPT_ATTACK:
