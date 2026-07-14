@@ -176,6 +176,18 @@ class AlakazamPolicy:
                          and not _get(self.state, "supporterPlayed"))
         self.can_switch = any(_get(o, "type") == OPT_RETREAT
                               for o in (_get(obs_select, "option") or []))
+        # Deck-out racing (17% of ladder losses were self-inflicted deck-outs
+        # vs stall): once nobody is scoring prizes deep into the game, every
+        # optional draw is a step toward losing the deck-out race — stop
+        # drawing unless we hold a comfortable deck lead.
+        self.no_draws = False
+        if self.me is not None and self.opp is not None:
+            my_deck_n = _get(self.me, "deckCount") or 0
+            stalled = (len(_get(self.me, "prize") or []) == 6
+                       and len(_get(self.opp, "prize") or []) == 6
+                       and (_get(self.state, "turn") or 0) >= 14)
+            self.no_draws = my_deck_n <= 6 or (
+                stalled and my_deck_n <= (_get(self.opp, "deckCount") or 0) + 5)
 
     @property
     def plan(self) -> Plan:
@@ -273,7 +285,9 @@ class AlakazamPolicy:
                 # Go second: first supporter and first attack beat first evolve
                 # for a draw-engine deck. (A/B'd vs going first.)
                 return -1
-            return 1
+            # Optional effects in this deck are almost all draws (Psychic
+            # Draw); decline them when drawing is losing the deck-out race.
+            return -1 if self.no_draws else 1
         if kind == OPT_NO:
             return 0
         if kind == OPT_CARD:
@@ -290,7 +304,7 @@ class AlakazamPolicy:
         if kind == OPT_ABILITY:
             # Run Away Draw etc: free cards. Skip when it would deck us out,
             # and don't let Dudunsparce shuffle itself off a thin board.
-            if self._low_deck():
+            if self._low_deck() or self.no_draws:
                 return -1
             card = self._card_at(option)
             if (card is not None and _get(card, "id") == DUDUNSPARCE
@@ -329,11 +343,11 @@ class AlakazamPolicy:
             board = sum(1 for p in self._board(self.me) if p is not None)
             return 5500 if board < 4 else 1500
         if card_id == POKE_PAD:
-            return -1 if self._low_deck() else 5000
+            return -1 if self._low_deck() or self.no_draws else 5000
         if card_id == DAWN:
-            return -1 if self._low_deck() else 3050
+            return -1 if self._low_deck() or self.no_draws else 3050
         if card_id == HILDA:
-            return -1 if self._low_deck() else 3000
+            return -1 if self._low_deck() or self.no_draws else 3000
         if card_id == BOSS:
             return 3200 if self.plan.target >= 1 else -1
         if card_id == ENH_HAMMER:
