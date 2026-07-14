@@ -1,8 +1,8 @@
-"""Pure-numpy inference for the trained option ranker.
+"""Pure-numpy inference for trained nets (the bundle ships numpy only).
 
-Mirrors ptcg.training.torch_model.OptionRanker.forward exactly, so the
-submission bundle needs numpy only. Used first as the search agent's root
-ordering (which options deserve rollouts), later as a rollout policy.
+NumpyRanker mirrors ptcg.training.torch_model.OptionRanker (BC policy net,
+shelved). NumpyValue mirrors ptcg.training.train_value.ValueNet — the board
+win-expectation net used to grade truncated search rollouts.
 """
 
 import json
@@ -18,6 +18,30 @@ from ptcg.training.encoding import (
 
 def _relu(x):
     return np.maximum(x, 0.0)
+
+
+class NumpyValue:
+    """Board -> win expectation in (-1, 1) for the player to move."""
+
+    def __init__(self, npz_path: str | Path):
+        data = np.load(npz_path)
+        self.emb = data["emb"]
+        self.w1, self.b1 = data["w1"], data["b1"]
+        self.w2, self.b2 = data["w2"], data["b2"]
+        self.vocab = None
+
+    def value(self, board) -> float:
+        if self.vocab is None:
+            from ptcg.training.encoding import build_card_vocab
+            self.vocab = build_card_vocab()
+        from ptcg.training.value_data import _extra_features
+        ids = board_card_ids(board, self.vocab)
+        pooled = self.emb[ids].mean(axis=0)
+        feats = np.array(board_features(board) + _extra_features(board),
+                         dtype=np.float32)
+        x = np.concatenate([pooled, feats])
+        h = _relu(x @ self.w1.T + self.b1)
+        return float(np.tanh(h @ self.w2.T + self.b2)[0])
 
 
 class NumpyRanker:

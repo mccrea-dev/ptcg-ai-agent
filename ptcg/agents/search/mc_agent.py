@@ -57,7 +57,7 @@ def _truncated_value(cur, me: int) -> float:
 
 
 def _rollout(root, first_action: list[int], policy=_policy_on_search_obs,
-             max_steps: int = MAX_ROLLOUT_STEPS) -> float:
+             max_steps: int = MAX_ROLLOUT_STEPS, eval_fn=None) -> float:
     """Play first_action from root, then policy-vs-policy to the end (or the
     step cap). Returns +1/-1 for a real result, else a board-aware value
     estimate — a truncated rollout with a sane eval buys several finished
@@ -75,7 +75,7 @@ def _rollout(root, first_action: list[int], policy=_policy_on_search_obs,
     if result == 1 - me:
         return -1.0
     if result < 0:
-        return _truncated_value(cur, me)
+        return (eval_fn or _truncated_value)(cur, me)
     return 0.0
 
 
@@ -108,8 +108,10 @@ def make_agent(deck: list[int] | None = None,
                ranker_path: str | None = None,  # trained BC net for root ordering
                net_rollouts: bool = False,  # net also pilots both sides in rollouts
                prior_anchor_z: float = 1.0,  # 0 = raw argmax over rollout means
-               rollout_steps: int = 160):  # truncate + prize-diff eval; ~4-6
-               # turns of lookahead at a fraction of a finished game's cost
+               rollout_steps: int = 160,  # truncate + eval; ~4-6 turns of
+               # lookahead at a fraction of a finished game's cost
+               value_path: str | None = None):  # trained value net grades
+               # truncated rollouts instead of the hand-tuned board eval
     # halving_schedule stays available for experiments, but defaults off:
     # pruning on 4 noisy rollouts measured 46.7% CI[34.6,59.1] vs uniform.
     # confidence_prune_z > 0 enables evidence-based pruning instead: an option
@@ -134,6 +136,15 @@ def make_agent(deck: list[int] | None = None,
     if ranker_path is not None:
         from ptcg.agents.learned import NumpyRanker
         ranker = NumpyRanker(ranker_path)
+    eval_fn = None
+    if value_path is not None:
+        from ptcg.agents.learned import NumpyValue
+        net = NumpyValue(value_path)
+
+        def eval_fn(cur, me):
+            # Net scores from the to-move player's view; flip to root's view.
+            v = net.value(cur)
+            return v if cur.yourIndex == me else -v
 
     rollout_policy = _policy_on_search_obs
     if net_rollouts and ranker is not None:
@@ -236,7 +247,8 @@ def make_agent(deck: list[int] | None = None,
                     det.opponent_prize, det.opponent_hand, det.opponent_active,
                 )
                 for i in survivors:
-                    sums[i] += _rollout(root, [i], rollout_policy, steps_cap)
+                    sums[i] += _rollout(root, [i], rollout_policy, steps_cap,
+                                        eval_fn)
                     counts[i] += 1
                     # A pass is re-entrant on the clock: without this check a
                     # slow pass can overshoot the deadline by its full length.
