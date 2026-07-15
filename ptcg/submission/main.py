@@ -29,9 +29,20 @@ def read_deck_csv() -> list[int]:
 
 _DECK = read_deck_csv()
 
+
+def _find_value_net() -> str | None:
+    for p in ("value_net.npz", "/kaggle_simulations/agent/value_net.npz"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
 try:
     from ptcg.agents.search.mc_agent import make_agent
-    _search = make_agent(deck=_DECK)
+    try:
+        _search = make_agent(deck=_DECK, value_path=_find_value_net())
+    except Exception:
+        _search = make_agent(deck=_DECK)  # net failed to load: hand eval
 except Exception:
     _search = None
 

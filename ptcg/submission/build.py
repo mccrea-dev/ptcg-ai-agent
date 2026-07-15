@@ -44,6 +44,10 @@ def build(deck_name: str = "starter") -> Path:
     # The agent imports the ptcg package, so ship it alongside main.py.
     shutil.copytree(REPO / "ptcg", STAGE / "ptcg",
                     ignore=shutil.ignore_patterns("__pycache__"))
+    # Trained value net for rollout evaluation (main.py enables it if present).
+    value_net = REPO / "data" / "train" / "value_net.npz"
+    if value_net.exists():
+        shutil.copy(value_net, STAGE / "value_net.npz")
 
     # cwd=STAGE so main.py resolves deck.csv the same way it will on Kaggle.
     # Small search budget keeps the verification game fast; on Kaggle the
